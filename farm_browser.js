@@ -91,25 +91,28 @@ async function githubSignup(page, email) {
     return { ok: false, err: 'DataDome blocked' };
   }
 
-  // Fill email
+  // Fill email — GitHub uses input[name="user[email]"]
   log('  Filling email...');
-  await page.waitForSelector('#email', { timeout: 15000 });
-  await page.type('#email', email, { delay: 50 });
+  await page.waitForSelector('input[name="user[email]"]', { timeout: 15000 });
+  await page.type('input[name="user[email]"]', email, { delay: 50 });
+  await page.waitForTimeout(1500);
   await page.keyboard.press('Enter');
   await page.waitForTimeout(3000);
 
   // Fill password
   log('  Filling password...');
-  await page.waitForSelector('#password', { timeout: 15000 });
-  await page.type('#password', GITHUB_PASSWORD, { delay: 50 });
+  await page.waitForSelector('input[name="user[password]"], input[type="password"]', { timeout: 15000 });
+  await page.type('input[name="user[password]"], input[type="password"]', GITHUB_PASSWORD, { delay: 50 });
+  await page.waitForTimeout(1500);
   await page.keyboard.press('Enter');
   await page.waitForTimeout(3000);
 
   // Fill username
   log('  Filling username...');
-  await page.waitForSelector('#login', { timeout: 15000 });
+  await page.waitForSelector('input[name="user[login]"]', { timeout: 15000 });
   const username = randomUser();
-  await page.type('#login', username, { delay: 50 });
+  await page.type('input[name="user[login]"]', username, { delay: 50 });
+  await page.waitForTimeout(1500);
   await page.keyboard.press('Enter');
   await page.waitForTimeout(3000);
 
