@@ -91,10 +91,26 @@ async function githubSignup(page, email) {
     return { ok: false, err: 'DataDome blocked' };
   }
 
-  // Fill email — GitHub uses input[name="user[email]"]
+  // Debug: dump all input fields on page
+  const inputs = await page.evaluate(() => {
+    return Array.from(document.querySelectorAll('input, select, textarea')).map(el => ({
+      tag: el.tagName,
+      type: el.type,
+      name: el.name,
+      id: el.id,
+      placeholder: el.placeholder,
+      visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+    }));
+  });
+  log('  Fields: ' + JSON.stringify(inputs).substring(0, 500));
+
+  await page.screenshot({ path: '/data/data/com.termux/files/home/signup_debug.png' });
+
+  // Try multiple selectors for email
+  const emailSelector = 'input[name="user[email]"], input[type="email"], #email, input[name="email"], input[autocomplete="email"]';
   log('  Filling email...');
-  await page.waitForSelector('input[name="user[email]"]', { timeout: 15000 });
-  await page.type('input[name="user[email]"]', email, { delay: 50 });
+  await page.waitForSelector(emailSelector, { timeout: 15000 });
+  await page.type(emailSelector, email, { delay: 50 });
   await page.waitForTimeout(1500);
   await page.keyboard.press('Enter');
   await page.waitForTimeout(3000);
