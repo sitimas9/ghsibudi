@@ -73,6 +73,64 @@ async function diagnose(page, label) {
   return info;
 }
 
+async function solveDataDome(page) {
+  // Detect DataDome challenge iframe
+  const ddUrl = await page.evaluate(() => {
+    const f = document.querySelector('iframe');
+    return f ? f.src : '';
+  });
+  if (!ddUrl || (!ddUrl.includes('captcha-delivery') && !ddUrl.includes('datadome'))) {
+    log(`  No DataDome iframe (${ddUrl.substring(0,60)})`);
+    return false;
+  }
+  log('  🛡️ DataDome challenge detected — solving slider...');
+
+  const ddFrame = page.frames().find(f => f.url().includes('captcha-delivery') || f.url().includes('datadome'));
+  if (!ddFrame) { log('  Frame not accessible'); return false; }
+
+  await sleep(3000);
+
+  // Find the slider button
+  const sliderHandle = await ddFrame.$('#slider-captcha-button, [id*="slider"], [class*="slider"] button, button[aria-label*="drag"]');
+  if (!sliderHandle) {
+    log('  Slider element not found in frame');
+    return false;
+  }
+  const box = await sliderHandle.boundingBox();
+  if (!box) { log('  Slider no bounding box'); return false; }
+
+  const startX = box.x + box.width / 2;
+  const startY = box.y + box.height / 2;
+
+  await page.mouse.move(startX, startY);
+  await sleep(500);
+  await page.mouse.down();
+  await sleep(300);
+
+  // Human-like drag with slight jitter
+  const distance = 260;
+  const steps = 30;
+  for (let i = 1; i <= steps; i++) {
+    const x = startX + (distance * i / steps);
+    const y = startY + Math.sin(i / 4) * 4;
+    await page.mouse.move(x, y);
+    await sleep(15 + Math.floor(Math.random() * 35));
+  }
+  await sleep(400);
+  await page.mouse.up();
+  log('  Slider dragged — waiting for verification...');
+  await sleep(8000);
+
+  // Check result
+  const after = await page.evaluate(() => ({
+    inputs: document.querySelectorAll('input').length,
+    htmlLen: document.documentElement.outerHTML.length,
+    stillChallenge: !!document.querySelector('iframe[src*="captcha-delivery"]')
+  }));
+  log(`  After solve: inputs=${after.inputs} challenge=${after.stillChallenge}`);
+  return !after.stillChallenge && after.inputs > 0;
+}
+
 async function githubSignup(page, email) {
   log('Step 1: Session warming — open homepage first...');
   await page.goto('https://github.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -90,7 +148,17 @@ async function githubSignup(page, email) {
   log('Step 1b: Navigate to /signup in same session...');
   await page.goto('https://github.com/signup', { waitUntil: 'domcontentloaded', timeout: 60000 });
   await sleep(5000);
-  const d1 = await diagnose(page, 'load1');
+  let d1 = await diagnose(page, 'load1');
+
+  // DataDome challenge → try slider solve (up to 3 attempts)
+  if (d1.inputs === 0) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      log(`  DataDome solve attempt ${attempt}/3...`);
+      const solved = await solveDataDome(page);
+      if (solved) { d1 = await diagnose(page, 'after-solve'); break; }
+      await sleep(5000);
+    }
+  }
 
   // If blank, try reload once
   if (d1.inputs === 0 && d1.htmlLen < 2000) {
