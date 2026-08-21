@@ -90,10 +90,21 @@ async function solveDataDome(page) {
 
   await sleep(3000);
 
+  // Debug: dump all clickable elements inside the frame
+  const frameDebug = await ddFrame.evaluate(() => {
+    const els = Array.from(document.querySelectorAll('button, [role="button"], input, div[id], span[id]'));
+    return els.slice(0, 20).map(el => ({
+      tag: el.tagName, id: el.id, cls: (el.className||'').toString().substring(0,50),
+      text: (el.innerText||'').substring(0,30)
+    }));
+  }).catch(e => 'frame eval error: '+e.message);
+  log(`  Frame elements: ${JSON.stringify(frameDebug).substring(0, 400)}`);
+
   // Find the slider button
-  const sliderHandle = await ddFrame.$('#slider-captcha-button, [id*="slider"], [class*="slider"] button, button[aria-label*="drag"]');
+  const sliderHandle = await ddFrame.$('#slider-captcha-button, [id*="slider"], [class*="slider"] button, button[aria-label*="drag"], button, [role="button"]');
   if (!sliderHandle) {
     log('  Slider element not found in frame');
+    await page.screenshot({ path: '/data/data/com.termux/files/home/datadome_debug.png' });
     return false;
   }
   const box = await sliderHandle.boundingBox();
