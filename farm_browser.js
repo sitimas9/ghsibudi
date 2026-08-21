@@ -74,7 +74,20 @@ async function diagnose(page, label) {
 }
 
 async function githubSignup(page, email) {
-  log('Step 1: Open github.com/signup...');
+  log('Step 1: Session warming — open homepage first...');
+  await page.goto('https://github.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await sleep(6000);
+  const warm = await diagnose(page, 'warm');
+
+  // If homepage also blank, reload once
+  if (warm.htmlLen < 2000) {
+    log('  Homepage blank — reloading...');
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await sleep(8000);
+    await diagnose(page, 'warm-reload');
+  }
+
+  log('Step 1b: Navigate to /signup in same session...');
   await page.goto('https://github.com/signup', { waitUntil: 'domcontentloaded', timeout: 60000 });
   await sleep(5000);
   const d1 = await diagnose(page, 'load1');
