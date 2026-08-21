@@ -91,6 +91,14 @@ async function githubSignup(page, email) {
     return { ok: false, err: 'DataDome blocked' };
   }
 
+  // Debug: what page did we actually get?
+  const pageUrl = page.url();
+  const pageTitle = await page.title();
+  const bodySnippet = await page.evaluate(() => document.body.innerText.substring(0, 300));
+  log(`  URL: ${pageUrl}`);
+  log(`  Title: ${pageTitle}`);
+  log(`  Body: ${bodySnippet.replace(/\n/g, ' | ').substring(0, 200)}`);
+
   // Debug: dump all input fields on page
   const inputs = await page.evaluate(() => {
     return Array.from(document.querySelectorAll('input, select, textarea')).map(el => ({
@@ -103,6 +111,17 @@ async function githubSignup(page, email) {
     }));
   });
   log('  Fields: ' + JSON.stringify(inputs).substring(0, 500));
+
+  // If no fields, wait for JS render and retry once
+  if (inputs.length === 0) {
+    log('  No fields found — waiting 8s for JS render...');
+    await page.waitForTimeout(8000);
+    const retry = await page.evaluate(() => document.querySelectorAll('input').length);
+    log(`  After wait: ${retry} input fields`);
+    if (retry === 0) {
+      return { ok: false, err: `Page has no inputs. URL=${pageUrl} Title=${pageTitle}` };
+    }
+  }
 
   await page.screenshot({ path: '/data/data/com.termux/files/home/signup_debug.png' });
 
