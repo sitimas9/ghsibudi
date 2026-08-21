@@ -1,30 +1,23 @@
 #!/usr/bin/env node
 /**
- * GitHub Farm → CodeBuddy Token — Browser Edition (Termux)
- * Uses puppeteer-core + system Chromium (real browser = real TLS = bypass DataDome)
- *
- * Flow:
- * 1. Launch Chromium (headless)
- * 2. Open github.com/signup → fill email → fill password+username → submit
- * 3. Fetch OTP from Gmail via Python subprocess (imaplib)
- * 4. Submit OTP → GitHub account created
- * 5. CodeBuddy OAuth via Keycloak GitHub broker → JWT token
- * 6. Send token to collector
+ * GitHub Farm → CodeBuddy Token — Browser Edition v2 (Termux)
+ * puppeteer-core + system Chromium
  */
-
 const puppeteer = require('puppeteer-core');
-const { execSync, execFileSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const fs = require('fs');
 
-// ═══ CONFIG (from .env) ═══
-const GITHUB_EMAIL    = process.env.GITHUB_EMAIL    || 'YOUR_GITHUB_EMAIL@gmail.com';
+// ═══ CONFIG ═══
+const GITHUB_EMAIL    = process.env.GITHUB_EMAIL    || 'YOUR_GMAIL@gmail.com';
 const GITHUB_PASSWORD = process.env.GITHUB_PASSWORD || 'YOUR_PASSWORD';
 const IMAP_USER       = process.env.IMAP_USER       || 'YOUR_GMAIL@gmail.com';
 const IMAP_PASS       = process.env.IMAP_APP_PASS   || 'YOUR_APP_PASS';
 const COLLECTOR_URL   = process.env.COLLECTOR_URL   || 'http://43.153.194.107:8899/token';
 const DELAY           = parseInt(process.env.DELAY || '20');
-const CHROMIUM_PATH   = '/data/data/com.termux/files/usr/bin/chromium-browser';
+const CHROMIUM_PATH   = process.env.CHROMIUM_PATH   || '/data/data/com.termux/files/usr/bin/chromium-browser';
 const ROUNDS          = parseInt(process.env.ROUNDS || '5');
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function log(msg) {
   const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -33,11 +26,9 @@ function log(msg) {
   fs.appendFileSync('/data/data/com.termux/files/home/farm_log.txt', line + '\n');
 }
 
-// ═══ IMAP OTP FETCH (Python subprocess) ═══
 function fetchOTP(waitSec = 120) {
   const pyScript = `
 import imaplib, email, re, time, sys
-from email.header import decode_header
 M = imaplib.IMAP4_SSL("imap.gmail.com")
 M.login("${IMAP_USER}", "${IMAP_PASS}")
 deadline = time.time() + ${waitSec}
@@ -56,290 +47,238 @@ while time.time() < deadline:
             body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
         codes = re.findall(r"\\b\\d{8}\\b", body)
         if codes:
-            print(codes[0])
-            M.logout()
-            sys.exit(0)
-    M.close()
+            print(codes[0]); M.logout(); sys.exit(0)
     time.sleep(10)
-M.logout()
-sys.exit(1)
+M.logout(); sys.exit(1)
 `;
   try {
-    const result = execFileSync('python3', ['-c', pyScript], {
-      timeout: waitSec * 1000 + 10000,
-      encoding: 'utf8'
-    }).trim();
-    return result || null;
-  } catch (e) {
-    return null;
-  }
+    return execFileSync('python3', ['-c', pyScript], { timeout: waitSec*1000+10000, encoding: 'utf8' }).trim() || null;
+  } catch (e) { return null; }
 }
 
-// ═══ RANDOM USERNAME ═══
-function randomUser() {
-  return 'devq' + Math.floor(Math.random() * 900000 + 100000);
+const randomUser = () => 'devq' + Math.floor(Math.random()*900000+100000);
+
+async function diagnose(page, label) {
+  const url = page.url();
+  const title = await page.title();
+  const info = await page.evaluate(() => ({
+    htmlLen: document.documentElement.outerHTML.length,
+    bodyText: document.body ? document.body.innerText.substring(0,150) : '(no body)',
+    inputs: document.querySelectorAll('input').length,
+    frames: document.querySelectorAll('iframe').length,
+  }));
+  log(`  [${label}] URL=${url}`);
+  log(`  [${label}] Title="${title}" html=${info.htmlLen}ch inputs=${info.inputs} iframes=${info.frames}`);
+  log(`  [${label}] Body="${info.bodyText.replace(/\n/g,' | ').substring(0,120)}"`);
+  return info;
 }
 
-// ═══ GITHUB SIGNUP (browser) ═══
 async function githubSignup(page, email) {
   log('Step 1: Open github.com/signup...');
-  await page.goto('https://github.com/signup', { waitUntil: 'networkidle2', timeout: 60000 });
+  await page.goto('https://github.com/signup', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await sleep(5000);
+  const d1 = await diagnose(page, 'load1');
 
-  // Check if DataDome blocked
-  const bodyText = await page.evaluate(() => document.body.innerText);
-  if (bodyText.includes('DataDome') || bodyText.includes('captcha-delivery')) {
-    return { ok: false, err: 'DataDome blocked' };
+  // If blank, try reload once
+  if (d1.inputs === 0 && d1.htmlLen < 2000) {
+    log('  Page blank — reloading...');
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await sleep(8000);
+    await diagnose(page, 'reload');
   }
 
-  // Debug: what page did we actually get?
-  const pageUrl = page.url();
-  const pageTitle = await page.title();
-  const bodySnippet = await page.evaluate(() => document.body.innerText.substring(0, 300));
-  log(`  URL: ${pageUrl}`);
-  log(`  Title: ${pageTitle}`);
-  log(`  Body: ${bodySnippet.replace(/\n/g, ' | ').substring(0, 200)}`);
-
-  // Debug: dump all input fields on page
-  const inputs = await page.evaluate(() => {
-    return Array.from(document.querySelectorAll('input, select, textarea')).map(el => ({
-      tag: el.tagName,
-      type: el.type,
-      name: el.name,
-      id: el.id,
-      placeholder: el.placeholder,
-      visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-    }));
-  });
-  log('  Fields: ' + JSON.stringify(inputs).substring(0, 500));
-
-  // If no fields, wait for JS render and retry once
-  if (inputs.length === 0) {
-    log('  No fields found — waiting 8s for JS render...');
-    await page.waitForTimeout(8000);
-    const retry = await page.evaluate(() => document.querySelectorAll('input').length);
-    log(`  After wait: ${retry} input fields`);
-    if (retry === 0) {
-      return { ok: false, err: `Page has no inputs. URL=${pageUrl} Title=${pageTitle}` };
-    }
-  }
-
-  await page.screenshot({ path: '/data/data/com.termux/files/home/signup_debug.png' });
-
-  // Try multiple selectors for email
-  const emailSelector = 'input[name="user[email]"], input[type="email"], #email, input[name="email"], input[autocomplete="email"]';
-  log('  Filling email...');
-  await page.waitForSelector(emailSelector, { timeout: 15000 });
-  await page.type(emailSelector, email, { delay: 50 });
-  await page.waitForTimeout(1500);
-  await page.keyboard.press('Enter');
-  await page.waitForTimeout(3000);
-
-  // Fill password
-  log('  Filling password...');
-  await page.waitForSelector('input[name="user[password]"], input[type="password"]', { timeout: 15000 });
-  await page.type('input[name="user[password]"], input[type="password"]', GITHUB_PASSWORD, { delay: 50 });
-  await page.waitForTimeout(1500);
-  await page.keyboard.press('Enter');
-  await page.waitForTimeout(3000);
-
-  // Fill username
-  log('  Filling username...');
-  await page.waitForSelector('input[name="user[login]"]', { timeout: 15000 });
-  const username = randomUser();
-  await page.type('input[name="user[login]"]', username, { delay: 50 });
-  await page.waitForTimeout(1500);
-  await page.keyboard.press('Enter');
-  await page.waitForTimeout(3000);
-
-  // Skip email preferences (if asked)
-  const notNow = await page.$('text/Don\'t use a free email') ;
-  // may ask about email preferences — click "skip"
+  // Wait for email input up to 30s
+  log('  Waiting for email field...');
+  let emailSel;
   try {
-    const skipBtn = await page.$('button:has-text("Skip")') || await page.$('text/Skip');
-    if (skipBtn) { await skipBtn.click(); await page.waitForTimeout(2000); }
-  } catch (e) {}
+    await page.waitForFunction(() => {
+      const el = document.querySelector('input[type="email"], input[name="user[email]"], #email, input[name="email"]');
+      return el && !!(el.offsetWidth || el.offsetHeight);
+    }, { timeout: 30000 });
+    emailSel = await page.evaluate(() => {
+      const el = document.querySelector('input[type="email"], input[name="user[email]"], #email, input[name="email"]');
+      return el.name ? `input[name="${el.name}"]` : (el.id ? '#'+el.id : 'input[type="email"]');
+    });
+  } catch (e) {
+    await page.screenshot({ path: '/data/data/com.termux/files/home/signup_debug.png' });
+    const html = await page.evaluate(() => document.documentElement.outerHTML.substring(0, 1000));
+    fs.writeFileSync('/data/data/com.termux/files/home/signup_debug.html', html);
+    return { ok: false, err: 'email field never appeared (screenshot+html saved)' };
+  }
 
-  // Puzzle/captcha — wait for verify page
-  log('  Waiting for verify page...');
-  await page.waitForTimeout(5000);
+  log(`  Filling email via ${emailSel}...`);
+  await page.click(emailSel);
+  await page.type(emailSel, email, { delay: 60 });
+  await sleep(1000);
+  await page.keyboard.press('Enter');
+  await sleep(4000);
 
+  // Password
+  log('  Filling password...');
+  await page.waitForFunction(() => {
+    const el = document.querySelector('input[type="password"]');
+    return el && !!(el.offsetWidth || el.offsetHeight);
+  }, { timeout: 20000 });
+  const passSel = await page.evaluate(() => {
+    const el = document.querySelector('input[type="password"]');
+    return el.name ? `input[name="${el.name}"]` : 'input[type="password"]';
+  });
+  await page.click(passSel);
+  await page.type(passSel, GITHUB_PASSWORD, { delay: 60 });
+  await sleep(1000);
+  await page.keyboard.press('Enter');
+  await sleep(4000);
+
+  // Username
+  log('  Filling username...');
+  await page.waitForFunction(() => {
+    const el = document.querySelector('input[name="user[login]"], input[name="login"]:not([type="password"])');
+    return el && !!(el.offsetWidth || el.offsetHeight);
+  }, { timeout: 20000 }).catch(() => {});
+  const userSel = await page.evaluate(() => {
+    const el = document.querySelector('input[name="user[login]"]');
+    return el ? 'input[name="user[login]"]' : null;
+  });
+  const username = randomUser();
+  if (userSel) {
+    await page.click(userSel);
+    await page.type(userSel, username, { delay: 60 });
+    await sleep(1000);
+    await page.keyboard.press('Enter');
+    await sleep(4000);
+  } else {
+    log('  ⚠️ username field not found — continuing anyway');
+  }
+
+  await page.screenshot({ path: '/data/data/com.termux/files/home/signup_step1.png' });
   return { ok: true, username };
 }
 
-// ═══ VERIFY OTP ═══
 async function verifyOTP(page) {
   log('Step 2: Fetching OTP from Gmail...');
   const otp = fetchOTP(120);
-  if (!otp) {
-    return { ok: false, err: 'OTP not received' };
-  }
+  if (!otp) return { ok: false, err: 'OTP not received' };
   log(`  OTP: ${otp}`);
 
-  log('Step 3: Submitting OTP...');
-  // Look for OTP input field
-  const otpInput = await page.$('input[type="text"]') || await page.$('input[name="otp"]') || await page.$('#otp');
-  if (otpInput) {
-    await otpInput.type(otp, { delay: 100 });
-    await page.keyboard.press('Enter');
-    await page.waitForTimeout(5000);
-    return { ok: true };
+  // Look for OTP inputs (GitHub uses one input or several single-digit boxes)
+  const filled = await page.evaluate((code) => {
+    const inp = document.querySelector('input[name="otp"], input[autocomplete="one-time-code"], input[inputmode="numeric"]');
+    if (inp) { inp.value = code; inp.dispatchEvent(new Event('input', {bubbles:true})); return true; }
+    return false;
+  }, otp);
+
+  if (!filled) {
+    // fallback: type into focused element
+    log('  No otp input found — typing raw...');
+    await page.keyboard.type(otp, { delay: 120 });
   }
-  return { ok: false, err: 'OTP input field not found' };
+  await sleep(2000);
+  await page.keyboard.press('Enter');
+  await sleep(5000);
+  return { ok: true };
 }
 
-// ═══ CODEBUDDY OAUTH ═══
-async function codebuddyOAuth(page, username) {
+async function codebuddyOAuth(page) {
   log('Step 4: CodeBuddy OAuth...');
-
-  // Start auth state
   const stateResp = await page.evaluate(async () => {
     const r = await fetch('https://www.codebuddy.ai/v2/plugin/auth/state?platform=CLI', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
     });
     return r.json();
   });
-
   const state = stateResp.state;
   const authUrl = stateResp.authUrl;
-  if (!state || !authUrl) {
-    return { ok: false, err: 'No state/authUrl' };
-  }
-  log(`  State: ${state.substring(0, 20)}...`);
+  if (!state || !authUrl) return { ok: false, err: 'no state/authUrl: '+JSON.stringify(stateResp).substring(0,100) };
 
-  // Navigate to auth URL → GitHub OAuth → auto authorize (already logged in)
   log('  Following OAuth URL...');
-  await page.goto(authUrl, { waitUntil: 'networkidle2', timeout: 60000 });
-  await page.waitForTimeout(5000);
+  await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await sleep(6000);
 
-  // If "Authorize" button appears, click it
-  try {
-    const authBtn = await page.$('button:has-text("Authorize")') || await page.$('input[name="authorize"]');
-    if (authBtn) {
-      await authBtn.click();
-      await page.waitForTimeout(5000);
-    }
-  } catch (e) {}
+  // Click Authorize if present
+  const clicked = await page.evaluate(() => {
+    const btn = document.querySelector('button[value="Authorize"], input[name="authorize"], button[name="authorize"]');
+    if (btn) { btn.click(); return true; }
+    return false;
+  });
+  if (clicked) { log('  Clicked Authorize'); await sleep(6000); }
 
-  // Poll for token
-  log('  Polling for token...');
-  for (let i = 0; i < 12; i++) {
-    await page.waitForTimeout(5000);
-    const tokenResp = await page.evaluate(async (s) => {
+  log('  Polling token...');
+  for (let i = 0; i < 15; i++) {
+    await sleep(5000);
+    const tok = await page.evaluate(async (s) => {
       const r = await fetch(`https://www.codebuddy.ai/v2/plugin/auth/token?state=${s}&platform=CLI`);
       return r.json();
     }, state);
-
-    if (tokenResp.accessToken) {
-      log(`  ✅ Token received! (${tokenResp.accessToken.length} chars)`);
-      return { ok: true, token: tokenResp };
+    if (tok.accessToken) {
+      log(`  ✅ Token received (${tok.accessToken.length} chars)`);
+      return { ok: true, token: tok };
     }
   }
-  return { ok: false, err: 'Token poll timeout' };
+  return { ok: false, err: 'token poll timeout' };
 }
 
-// ═══ SEND TO COLLECTOR ═══
 async function sendToCollector(tokenData) {
   try {
     const resp = await fetch(COLLECTOR_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(tokenData)
     });
     return resp.ok;
-  } catch (e) {
-    log(`  ⚠️ Collector error: ${e.message}`);
-    return false;
-  }
+  } catch (e) { log(`  ⚠️ collector: ${e.message}`); return false; }
 }
 
-// ═══ MAIN ═══
 async function main() {
   log('═══════════════════════════════════════');
-  log('GitHub Farm → CodeBuddy (Browser Edition)');
-  log(`Email: ${GITHUB_EMAIL}`);
-  log(`Rounds: ${ROUNDS}`);
+  log('GitHub Farm → CodeBuddy (Browser v2)');
+  log(`Email: ${GITHUB_EMAIL} | Rounds: ${ROUNDS}`);
   log('═══════════════════════════════════════');
 
   const browser = await puppeteer.launch({
     executablePath: CHROMIUM_PATH,
-    headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--window-size=1920,1080',
-    ]
+    headless: true,
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu']
   });
 
   const results = { ok: 0, fail: 0, tokens: [] };
 
   for (let round = 1; round <= ROUNDS; round++) {
     log(`\n${'═'.repeat(40)}\nRound ${round}/${ROUNDS}\n${'═'.repeat(40)}`);
-
-    // Dot-trick email
     const email = GITHUB_EMAIL.replace('@', `+gh${String(round).padStart(2,'0')}@`);
     log(`Email: ${email}`);
 
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36');
+    await page.setViewport({ width: 412, height: 915, isMobile: true });
 
-    // Step 1: Signup
     const signup = await githubSignup(page, email);
     if (!signup.ok) {
-      log(`  ❌ Signup failed: ${signup.err}`);
-      results.fail++;
-      await page.close();
-      if (signup.err.includes('DataDome')) {
-        log('  ⏳ Waiting 60s...');
-        await new Promise(r => setTimeout(r, 60000));
-      }
-      continue;
+      log(`  ❌ ${signup.err}`); results.fail++;
+      await page.close(); continue;
     }
-    log(`  ✅ Signup OK — username: ${signup.username}`);
+    log(`  ✅ Signup OK — ${signup.username}`);
 
-    // Step 2+3: OTP
     const otp = await verifyOTP(page);
-    if (!otp.ok) {
-      log(`  ❌ OTP failed: ${otp.err}`);
-      results.fail++;
-      await page.close();
-      continue;
-    }
-    log('  ✅ Email verified');
+    if (!otp.ok) { log(`  ❌ ${otp.err}`); results.fail++; await page.close(); continue; }
+    log('  ✅ Verified');
 
-    // Step 4: CodeBuddy OAuth
-    const oauth = await codebuddyOAuth(page, signup.username);
+    const oauth = await codebuddyOAuth(page);
     if (oauth.ok) {
-      log('  ✅ OAuth success!');
-      results.tokens.push({ github: signup.username, token: oauth.token.accessToken });
+      results.tokens.push({ github: signup.username, access_token: oauth.token.accessToken, refresh_token: oauth.token.refreshToken });
       results.ok++;
-
-      // Step 5: Send to collector
-      log('Step 5: Sending to collector...');
       const sent = await sendToCollector(oauth.token);
-      log(sent ? '  ✅ Sent!' : '  ⚠️ Collector offline — saved locally');
+      log(sent ? '  ✅ Sent to collector' : '  ⚠️ collector offline — saved locally');
     } else {
-      log(`  ❌ OAuth failed: ${oauth.err}`);
-      results.fail++;
+      log(`  ❌ OAuth: ${oauth.err}`); results.fail++;
     }
 
-    // Save progress
     fs.writeFileSync('/data/data/com.termux/files/home/farm_results.json', JSON.stringify(results, null, 2));
-
     await page.close();
 
-    if (round < ROUNDS) {
-      log(`\n⏳ Waiting ${DELAY}s...`);
-      await new Promise(r => setTimeout(r, DELAY * 1000));
-    }
+    if (round < ROUNDS) { log(`⏳ ${DELAY}s...`); await sleep(DELAY*1000); }
   }
 
   await browser.close();
-  log(`\n${'═'.repeat(50)}`);
-  log(`COMPLETE: ${results.ok} tokens, ${results.fail} fail`);
-  log(`Tokens saved: ~/farm_results.json`);
-  log(`${'═'.repeat(50)}`);
+  log(`\nDONE: ${results.ok} tokens, ${results.fail} fail → ~/farm_results.json`);
 }
 
 main().catch(e => { log(`FATAL: ${e.message}`); process.exit(1); });
